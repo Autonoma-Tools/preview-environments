@@ -1,0 +1,132 @@
+# Preview Environment E2E Tests
+#
+# Triggers Playwright against the preview URL whenever a hosting provider
+# (Vercel, Netlify, Railway, Render, Fly, Coolify, or any DIY setup that
+# calls the GitHub Deployments API) reports a successful deployment.
+#
+# How it works:
+#   1. Provider deploys a preview and POSTs a `deployment_status` event to
+#      GitHub with state=success and the preview URL in `environment_url`
+#      (or `target_url` as a fallback for older providers).
+#   2. This workflow filters on state=success and skips production envs
+#      so you don't accidentally hammer prod with E2E traffic.
+#   3. We export the preview URL as BASE_URL and hand it to Playwright.
+#      Your tests read `process.env.BASE_URL` (or `playwright.config.ts`
+#      baseURL) and point every request at the freshly deployed preview.
+#
+# Requirements:
+#   - Playwright installed as a dev dependency (`npm i -D @playwright/test`).
+#   - At least one test under `tests/` (or your configured testDir).
+#   - Default GITHUB_TOKEN has `deployments: read` permission (granted below).
+#
+# This is the Level 3 CI gate described in the blog post: real tests against
+# a real deployment, not a build-time smoke check.
+
+name: Preview E2E
+
+on:
+  deployment_status:
+
+# Cancel stale runs when a newer deployment for the same ref supersedes this one.
+concurrency:
+  group: preview-e2e-${{ github.event.deployment.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  deployments: read
+  statuses: write
+
+jobs:
+  e2e:
+    # Only run on successful preview deployments. Skip production and
+    # skip any state other than success (pending, failure, error, inactive).
+    if: >-
+      github.event.deployment_status.state == 'success'
+      && github.event.deployment.environment != 'production'
+      && github.event.deployment.environment != 'Production'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout the commit that was deployed
+        uses: actions/checkout@v4
+        with:
+          # Check out the exact SHA the provider built so your tests match the deploy.
+          ref: ${{ github.event.deployment.sha }}
+
+      - name: Resolve preview URL
+        id: preview
+        env:
+          ENVIRONMENT_URL: ${{ github.event.deployment_status.environment_url }}
+          TARGET_URL: ${{ github.event.deployment_status.target_url }}
+        run: |
+          # Prefer environment_url (the modern field). Fall back to target_url
+          # for older providers that still populate only the legacy field.
+          URL="${ENVIRONMENT_URL:-$TARGET_URL}"
+          if [ -z "$URL" ]; then
+            echo "::error::No preview URL found on deployment_status event."
+            echo "environment_url and target_url were both empty. Check that your"
+            echo "hosting provider populates one of them when creating deployments."
+            exit 1
+          fi
+          # Strip any trailing slash so BASE_URL + '/path' joins cleanly.
+          URL="${URL%/}"
+          echo "Resolved preview URL: $URL"
+          echo "url=$URL" >> "$GITHUB_OUTPUT"
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install Playwright browsers
+        run: npx playwright install --with-deps
+
+      - name: Wait for preview to be reachable
+        env:
+          BASE_URL: ${{ steps.preview.outputs.url }}
+        run: |
+          # Providers occasionally fire deployment_status: success a beat before
+          # the edge/CDN is warm. Poll for up to 60s before handing off to Playwright.
+          for i in $(seq 1 30); do
+            code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 "$BASE_URL" || echo "000")
+            if [ "$code" -ge 200 ] && [ "$code" -lt 500 ]; then
+              echo "Preview reachable (HTTP $code) after ${i} attempts."
+              exit 0
+            fi
+            echo "Attempt ${i}: HTTP $code — retrying in 2s..."
+            sleep 2
+          done
+          echo "::error::Preview URL never became reachable: $BASE_URL"
+          exit 1
+
+      - name: Run Playwright tests against the preview
+        env:
+          # Your playwright.config.ts should read process.env.BASE_URL and set
+          # it as the `use.baseURL`. Every page.goto('/foo') then hits the preview.
+          BASE_URL: ${{ steps.preview.outputs.url }}
+          CI: 'true'
+        run: npx playwright test
+
+      - name: Upload Playwright report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report-${{ github.event.deployment.sha }}
+          path: playwright-report/
+          retention-days: 14
+          if-no-files-found: ignore
+
+      - name: Upload Playwright traces
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-traces-${{ github.event.deployment.sha }}
+          path: test-results/
+          retention-days: 14
+          if-no-files-found: ignore
