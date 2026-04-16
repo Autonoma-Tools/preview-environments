@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "slug": "preview-environments",
+  "step": "created",
+  "completed_specs": [],
+  "pending_specs": ["gh-action-preview-e2e"],
+  "created_at": "2026-04-16T00:00:00Z",
+  "updated_at": "2026-04-16T00:00:00Z"
+}
